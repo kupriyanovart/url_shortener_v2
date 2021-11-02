@@ -1,19 +1,24 @@
 import hashlib
 import json
-import sqlite3
 from http import HTTPStatus
 
+
 from pydantic import BaseModel, AnyHttpUrl, ValidationError
-from sqlalchemy.exc import SQLAlchemyError
 
 import settings
-from db.model import Url
 from db.database import Session, Url as Url_model
 from response import Response
 
 
 class UrlCheck(BaseModel):
     url: AnyHttpUrl
+
+
+class BaseResponse(BaseModel):
+    status: HTTPStatus
+    data: str
+    content_type: str = "application/json; charset=utf-8"
+    headers: dict = {}
 
 
 class MainPageService:
@@ -24,21 +29,24 @@ class MainPageService:
         context = {
             "title": "Сокращатель ссылок 3000",
         }
-        content_type = "application/json; charset=utf-8"
-        return Response(HTTPStatus.OK, data=json.dumps(context, ensure_ascii=False), content_type=content_type)
+        data = json.dumps(context, ensure_ascii=False)
+        return Response(status=HTTPStatus.OK, data=data, content_type="application/json; charset=utf-8")
 
     def post(self):
         try:
             req_url = UrlCheck.parse_obj(self.request.body)
+        except ValidationError:
+            return Response(HTTPStatus.BAD_REQUEST, data="Введен некорректный URL")
+
+        try:
             service = CreateShortUrlService(req_url.url)
-            data = service.get_url_and_short_url()
+            resp = service.create_short_url()
         except ValidationError:
             return Response(HTTPStatus.BAD_REQUEST, data="Введен некорректный URL")
         except Exception:
-            data = {"Error": "INTERNAL_SERVER_ERROR"}
-            return Response(HTTPStatus.INTERNAL_SERVER_ERROR, data=data)
-        return Response(HTTPStatus.CREATED, data=data, content_type="application/json")
-
+            data = json.dumps({"Error": "Непредвиденная ошибка сервера"}, ensure_ascii=False)
+            return Response(HTTPStatus.INTERNAL_SERVER_ERROR, data=data, charset="utf-8")
+        return Response(status=resp.status, data=resp.data, content_type=resp.content_type)
 
     def get_response(self):
         if self.request.method == "GET":
@@ -64,28 +72,31 @@ class CreateShortUrlService:
         hash_code = hash_maker.generate()
         return hash_code
 
-    def create_short_url(self):
-        return settings.SITE_URL + "/" + self.create_hash()
-
     def _save_url(self):
-        url = Url_model(url=self.url, short_url=self.create_hash())
         with Session() as session:
-            try:
-                session.add(url)
-                session.commit()
-            except Exception as e:
-                raise SQLAlchemyError()
+            url_in_db = session.query(Url_model).filter(Url_model.url == self.url).first()
+            if url_in_db:
+                return url_in_db
+            url = Url_model(url=self.url, short_url=self.create_hash())
+            session.add(url)
+            session.commit()
+        return url
 
-        # url_db = Url()
-        # url_db.create_item(url=self.url, short_url=self.create_hash())
-
-    def get_url_and_short_url(self):
-        self._save_url()
-        result = {
-            "url": self.url,
-            "short_url": self.create_short_url(),
-        }
-        return json.dumps(result, ensure_ascii=False)
+    def create_short_url(self) -> BaseResponse:
+        url = self._save_url()
+        status = HTTPStatus.CREATED
+        if url:
+            result = {
+                "url": url.url,
+                "short_url": settings.SITE_URL + "/" + url.short_url,
+            }
+        else:
+            result = {
+                "Error": "Не удалось создать короткую ссылку"
+            }
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+        resp = BaseResponse(status=status, data=json.dumps(result, ensure_ascii=False))
+        return resp
 
 
 class RedirectService:
@@ -94,20 +105,31 @@ class RedirectService:
         self.hash_url = hash_url
 
     def get(self):
-        content_type = "application/json; charset=utf-8"
-        url_db = Url()
-        try:
-            context = url_db.read_item(short_url=self.hash_url)
-        except sqlite3.Error:
-            return Response(HTTPStatus.NOT_FOUND)
-        finally:
-            url_db.connection.close()
-
-        headers = {"Location": f"{context['url']}"}
-        return Response(HTTPStatus.FOUND, headers=headers, data=context["url"], content_type=content_type)
+        resp = self.get_url_to_redirect()
+        return Response(resp.status, headers=resp.headers, data=resp.data, content_type=resp.content_type)
 
     def get_response(self):
         if self.request.method == "GET":
             return self.get()
+        data = json.dumps({"Error": "Метод запроса не поддерживается сервером и не может быть обработан"})
+        return Response(status=HTTPStatus.NOT_IMPLEMENTED, data=data)
 
-
+    def get_url_to_redirect(self):
+        status = HTTPStatus.FOUND
+        with Session() as session:
+            res = session.query(Url_model).filter(Url_model.short_url == self.hash_url).first()
+        if res:
+            data = {
+                "url": res.url
+            }
+            headers = {
+                "Location": res.url
+            }
+        else:
+            status = HTTPStatus.NOT_FOUND
+            data = {
+                "Error": "Url адрес с такой короткой ссылкой не найден"
+            }
+            headers = {}
+        resp = BaseResponse(status=status, data=json.dumps(data, ensure_ascii=False), headers=headers)
+        return resp
